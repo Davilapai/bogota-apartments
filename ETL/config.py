@@ -29,10 +29,14 @@ class ETLConfig:
     
     # Directory Configuration
     data_dir: Path = Path("data")
+    raw_data_dir: Path = Path("data/raw")
     external_data_dir: Path = Path("data/external")
     interim_data_dir: Path = Path("data/interim")
     processed_data_dir: Path = Path("data/processed")
     logs_dir: Path = Path("logs")
+
+    # Runtime behavior
+    use_raw_files: bool = False
     
     # Processing Configuration
     chunk_size: int = 1000
@@ -55,11 +59,15 @@ class ETLConfig:
     @classmethod
     def from_env(cls) -> 'ETLConfig':
         """Create configuration from environment variables"""
+        use_raw_files_env = os.getenv('ETL_USE_RAW_FILES', 'false').strip().lower()
+        use_raw_files = use_raw_files_env in ('1', 'true', 'yes', 'y', 'on')
+
         return cls(
             mongo_uri=os.getenv('MONGO_URI', ''),
             mongo_database=os.getenv('MONGO_DATABASE', 'bogota_apartments'),
             mongo_collection_raw=os.getenv('MONGO_COLLECTION_RAW', 'scrapy_bogota_apartments'),
-            mongo_collection_processed=os.getenv('MONGO_COLLECTION_PROCESSED', 'scrapy_bogota_apartments_processed')
+            mongo_collection_processed=os.getenv('MONGO_COLLECTION_PROCESSED', 'scrapy_bogota_apartments_processed'),
+            use_raw_files=use_raw_files
         )
     
     def setup_directories(self):
@@ -73,8 +81,28 @@ class ETLConfig:
     
     def validate(self) -> bool:
         """Validate configuration"""
-        if not self.mongo_uri:
-            raise ValueError("MONGO_URI not configured. Check your .env file")
+        # If user explicitly wants file-based mode, validate raw files.
+        if self.use_raw_files:
+            raw_files = list(self.raw_data_dir.glob('*.json')) + list(self.raw_data_dir.glob('*.jsonl'))
+            raw_files = [f for f in raw_files if f.name.lower() != 'readme.md']
+            if not raw_files:
+                raise ValueError(
+                    f"ETL_USE_RAW_FILES is enabled but no .json/.jsonl files were found in {self.raw_data_dir}"
+                )
+            return True
+
+        # Mongo mode if URI is present.
+        if self.mongo_uri:
+            return True
+
+        # Fallback: if Mongo is not configured but raw files exist, allow file mode automatically.
+        raw_files = list(self.raw_data_dir.glob('*.json')) + list(self.raw_data_dir.glob('*.jsonl'))
+        raw_files = [f for f in raw_files if f.name.lower() != 'readme.md']
+        if not raw_files:
+            raise ValueError(
+                "MONGO_URI not configured and no raw files found in data/raw. "
+                "Provide MONGO_URI or place scraper outputs (.json/.jsonl) in data/raw."
+            )
         
         return True
 

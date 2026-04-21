@@ -33,6 +33,9 @@ class SpatialEnricher:
         
         df['coords_modified'] = False
         
+        if 'url' in df.columns:
+            df = self._infer_coordinates_from_url(df)
+            
         # Add localidad and barrio from coordinates
         df = self.add_locality_and_neighborhood(df)
         
@@ -50,6 +53,96 @@ class SpatialEnricher:
         
         return df
     
+    def _infer_coordinates_from_url(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract missing coordinates/neighborhoods from metrocuadrado URLs"""
+        import re
+        import unidecode
+        
+        if 'barrios' not in self.external_data or self.external_data['barrios'].empty:
+            return df
+            
+        barrios_gdf = self.external_data['barrios'].copy()
+        
+        def clean_text(text):
+            if pd.isna(text): return ''
+            cleaned = unidecode.unidecode(str(text)).upper().strip()
+            return re.sub(r'[^A-Z0-9 ]', '', cleaned)
+            
+        def clean_official(text):
+            # remove SC prefix from official names
+            c = clean_text(text)
+            c = re.sub(r'^SC\s+', '', c)
+            return c.strip()
+            
+        def get_neighborhood_from_url(url):
+            if pd.isna(url): return None
+            m = re.search(r'bogota-([a-z0-9-]+?)-\d+-(?:habitacion|bano|garaje|antiguedad)', str(url))
+            if m:
+                return m.group(1).replace('-', ' ')
+            return None
+
+        # Calculate centroids (to epsg:4326 so lat/lon match coords format)
+        if barrios_gdf.crs != 'EPSG:4326':
+            barrios_gdf = barrios_gdf.to_crs('EPSG:4326')
+        
+        # Avoid centroid warning by projecting first to a projected CRS, getting centroid, then projecting back
+        centroids = barrios_gdf.to_crs('+proj=cea').centroid.to_crs(barrios_gdf.crs)
+        barrios_gdf['centroid_lon'] = centroids.x
+        barrios_gdf['centroid_lat'] = centroids.y
+        barrios_gdf['clean_name'] = barrios_gdf['barriocomu'].apply(clean_official)
+        
+        replacements = {
+            'CHICO NORTE ET II': 'CHICO NORTE',
+            'CHICO NORTE ET III': 'CHICO NORTE III SECTOR',
+            'CHICO NORTE III': 'CHICO NORTE III SECTOR',
+            'CHICO NAVARRA': 'CHICO RESERVADO',
+            'EL CHICO': 'EL CHICO',
+            'CHICO': 'EL CHICO',
+            'SANTA BARBARA CENTRAL': 'SANTA BARBARA',
+            'ROSALES': 'LOS ROSALES',
+            'CHAPINERO': 'CHAPINERO CENTRAL',
+            'EL RETIRO': 'EL RETIRO'
+        }
+        
+        # Get missing coord mask
+        if 'latitud' not in df.columns:
+            df['latitud'] = np.nan
+        if 'longitud' not in df.columns:
+            df['longitud'] = np.nan
+            
+        missing_mask = df['latitud'].isna() | df['longitud'].isna()
+        if missing_mask.sum() == 0:
+            return df
+            
+        temp_urls = df.loc[missing_mask, 'url'].apply(get_neighborhood_from_url)
+        temp_clean = temp_urls.apply(clean_text).apply(lambda x: replacements.get(x, x))
+        
+        # Map back to official dataframe items
+        # To avoid duplicates in barriocomu clean names, drop them
+        dedup_barrios = barrios_gdf.drop_duplicates(subset=['clean_name']).set_index('clean_name')
+        
+        # Look up missing coords
+        matched = temp_clean.map(lambda x: x if x in dedup_barrios.index else np.nan).dropna()
+        
+        if len(matched) > 0:
+            logger.info(f"Inferring coordinates and locations for {len(matched)} records from URLs")
+            df.loc[matched.index, 'latitud'] = matched.map(lambda x: dedup_barrios.loc[x, 'centroid_lat']).astype(float)
+            df.loc[matched.index, 'longitud'] = matched.map(lambda x: dedup_barrios.loc[x, 'centroid_lon']).astype(float)
+            df.loc[matched.index, 'coords_modified'] = True
+            
+            if 'barrio' not in df.columns:
+                df['barrio'] = None
+            if 'localidad' not in df.columns:
+                df['localidad'] = None
+                
+            df.loc[matched.index, 'barrio'] = matched.map(lambda x: dedup_barrios.loc[x, 'barriocomu'])
+            
+            # Map locality if available
+            if 'localidad' in dedup_barrios.columns:
+                df.loc[matched.index, 'localidad'] = matched.map(lambda x: dedup_barrios.loc[x, 'localidad'])
+                
+        return df
+
     def add_locality_and_neighborhood(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add localidad and barrio columns using spatial join with geojson data"""
         logger.info("Adding locality and neighborhood information using spatial data...")

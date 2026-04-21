@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
+import json
 
 import geopandas as gpd
 import pandas as pd
@@ -68,6 +69,113 @@ class MongoDBExtractor:
         finally:
             if self.client:
                 self.client.close()
+
+
+class RawFileExtractor:
+    """Extract raw apartment data from local JSON/JSONL files"""
+
+    def __init__(self, config: ETLConfig):
+        self.config = config
+
+    def _list_candidate_files(self) -> list[Path]:
+        """List candidate raw files from data/raw directory"""
+        if not self.config.raw_data_dir.exists():
+            return []
+
+        files = list(self.config.raw_data_dir.glob("*.json")) + list(self.config.raw_data_dir.glob("*.jsonl"))
+
+        # Exclude documentation files and prioritize latest data exports.
+        excluded_names = {"readme.md", "readme"}
+        files = [f for f in files if f.name.lower() not in excluded_names]
+
+        # Prefer explicit no-mongo outputs first when present.
+        preferred = [f for f in files if "no_mongo" in f.name.lower()]
+        others = [f for f in files if f not in preferred]
+
+        return sorted(preferred, key=lambda p: p.stat().st_mtime) + sorted(others, key=lambda p: p.stat().st_mtime)
+
+    def _load_json_file(self, file_path: Path) -> list[dict]:
+        """Load records from a JSON file that contains a list or dict"""
+        with file_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+
+        if isinstance(data, dict):
+            # Support either single-record dict or nested list keys.
+            if "data" in data and isinstance(data["data"], list):
+                return [item for item in data["data"] if isinstance(item, dict)]
+            return [data]
+
+        return []
+
+    def _load_jsonl_file(self, file_path: Path) -> list[dict]:
+        """Load records from a JSONL file"""
+        records = []
+        with file_path.open("r", encoding="utf-8") as f:
+            for line_number, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    item = json.loads(line)
+                    if isinstance(item, dict):
+                        records.append(item)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"Skipping invalid JSONL line {line_number} in {file_path.name}: {e}"
+                    )
+
+        return records
+
+    def extract_raw_data(self) -> pd.DataFrame:
+        """Extract and combine apartment records from local raw files"""
+        raw_files = self._list_candidate_files()
+
+        if not raw_files:
+            logger.error(f"No raw files found in {self.config.raw_data_dir}")
+            return pd.DataFrame()
+
+        logger.info(f"Using local raw files mode. Found {len(raw_files)} candidate files")
+
+        all_records = []
+
+        for file_path in raw_files:
+            try:
+                if file_path.suffix.lower() == ".jsonl":
+                    records = self._load_jsonl_file(file_path)
+                else:
+                    records = self._load_json_file(file_path)
+
+                if records:
+                    logger.info(f"Loaded {len(records)} records from {file_path.name}")
+                    all_records.extend(records)
+                else:
+                    logger.warning(f"No valid records found in {file_path.name}")
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"Skipping malformed JSON file {file_path.name}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to load {file_path.name}: {e}")
+
+        if not all_records:
+            logger.error("No records were extracted from local raw files")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_records)
+
+        # Keep newest record per codigo when available.
+        if 'codigo' in df.columns:
+            before = len(df)
+            df = df.drop_duplicates(subset=['codigo'], keep='last')
+            removed = before - len(df)
+            if removed > 0:
+                logger.info(f"Removed {removed} duplicate records by codigo")
+
+        logger.info(f"Extracted {len(df)} raw records from local files")
+        return df
 
 
 class GeospatialDataExtractor:
@@ -268,6 +376,7 @@ class DataExtractor:
     def __init__(self, config: ETLConfig):
         self.config = config
         self.mongodb_extractor = MongoDBExtractor(config)
+        self.raw_file_extractor = RawFileExtractor(config)
         self.geospatial_extractor = GeospatialDataExtractor(config)
         self.transmilenio_extractor = TransMilenioExtractor(config)
         self.image_extractor = ImageExtractor(config)
@@ -277,8 +386,20 @@ class DataExtractor:
         logger.info("Starting data extraction phase...")
         
         try:
-            # Extract main apartment data
-            apartments_df = self.mongodb_extractor.extract_raw_data()
+            # Extract main apartment data from preferred source.
+            if self.config.use_raw_files:
+                apartments_df = self.raw_file_extractor.extract_raw_data()
+            elif self.config.mongo_uri:
+                try:
+                    apartments_df = self.mongodb_extractor.extract_raw_data()
+                except Exception as mongo_error:
+                    logger.warning(f"Mongo extraction failed ({mongo_error}). Falling back to local raw files")
+                    apartments_df = self.raw_file_extractor.extract_raw_data()
+            else:
+                apartments_df = self.raw_file_extractor.extract_raw_data()
+
+            if apartments_df.empty:
+                raise ValueError("No apartment records were extracted from configured sources")
             
             # Extract external geospatial data
             external_data = self.geospatial_extractor.load_all_external_data()

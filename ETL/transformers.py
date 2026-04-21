@@ -240,11 +240,27 @@ class DataCleaner:
         """Remove records with no location information"""
         location_cols = [col for col in ['localidad', 'barrio', 'sector'] if col in df.columns]
         if location_cols:
-            # Remove only if ALL location fields are missing
+            # Only remove rows that have no location AND no core business data.
+            # This preserves valid records from sources that omit location fields
+            # but still provide useful apartment data (e.g., price/area/rooms).
             no_location = df[location_cols].isna().all(axis=1)
-            if no_location.sum() > 0:
-                logger.info(f"Removing {no_location.sum()} records with no location information")
-                df = df[~no_location]
+
+            core_cols = [col for col in ['precio_venta', 'precio_arriendo', 'area', 'habitaciones', 'banos'] if col in df.columns]
+            if core_cols:
+                has_core_data = df[core_cols].notna().any(axis=1)
+            else:
+                # If no core columns exist, behave conservatively and keep records.
+                has_core_data = pd.Series(True, index=df.index)
+
+            removable = no_location & (~has_core_data)
+
+            if removable.sum() > 0:
+                logger.info(f"Removing {removable.sum()} records with no location and no core data")
+                df = df[~removable]
+
+            preserved_no_location = (no_location & has_core_data).sum()
+            if preserved_no_location > 0:
+                logger.info(f"Preserved {preserved_no_location} records without location because they contain core data")
         return df
     
     def _remove_invalid_coordinates(self, df: pd.DataFrame) -> pd.DataFrame:

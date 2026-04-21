@@ -12,8 +12,8 @@ VERSION = '3.0.0'
 
 
 # Database settings - uncomment if you want to use MongoDB
-MONGO_URI = os.getenv('MONGO_URI')
-MONGO_DATABASE = os.getenv('MONGO_DATABASE')
+# MONGO_URI = os.getenv('MONGO_URI')
+# MONGO_DATABASE = os.getenv('MONGO_DATABASE')
 
 
 # Asignación condicional con valores por defecto
@@ -73,9 +73,9 @@ EXTENSIONS = {
 
 # Configure item pipelines
 # See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
-ITEM_PIPELINES = {
-    'bogota_apartments.pipelines.MongoDBPipeline': 500 # uncomment if you want to use MongoDB
-}
+# ITEM_PIPELINES = {
+#     'bogota_apartments.pipelines.MongoDBPipeline': 500 # uncomment if you want to use MongoDB
+# }
 
 # Enable and configure the AutoThrottle extension (disabled by default)
 # See https://docs.scrapy.org/en/latest/topics/autothrottle.html

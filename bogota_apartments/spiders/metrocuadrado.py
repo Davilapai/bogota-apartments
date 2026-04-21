@@ -4,6 +4,7 @@ from selenium import webdriver
 from datetime import datetime
 import json
 import pymongo
+import re
 
 # Scrapy
 from bogota_apartments.items import ApartmentsItem
@@ -17,6 +18,7 @@ import os
 # 🔧 NUEVO: Importar parser y utilidades separadas
 from bogota_apartments.parsers import MetrocuadradoParser
 from bogota_apartments.utils import try_get, setup_spider_logging, log_scraping_stats, log_error_with_context, ProgressLogger
+
 
 class MetrocuadradoSpider(scrapy.Spider):
     """
@@ -32,15 +34,8 @@ class MetrocuadradoSpider(scrapy.Spider):
         """
         # 🔧 CORREGIDO: Usar nombre diferente para evitar conflicto con logger de Scrapy
         self.spider_logger = setup_spider_logging(self.name)
-        
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--headless=new')
-        chrome_options.add_argument('--window-size=1920x1080')
-        chrome_options.add_argument(f'user-agent={UserAgent().random}')
-        chrome_options.add_argument('--disk-cache=true')
-
-        self.driver = webdriver.Chrome(options=chrome_options,)
+        self.driver = None
+        self.use_selenium = False
         
         # 🔧 NUEVO: Inicializar parser especializado
         self.parser = MetrocuadradoParser(self.spider_logger)
@@ -52,6 +47,7 @@ class MetrocuadradoSpider(scrapy.Spider):
         self.collection_name = settings.get('MONGO_COLLECTION_RAW')
         self.db_client = None
         self.db = None
+        self.mongo_available = bool(self.mongo_uri)
         
         # 📊 Estadísticas de scraping
         self.stats = {
@@ -70,18 +66,170 @@ class MetrocuadradoSpider(scrapy.Spider):
         # 📈 Progress tracker
         self.progress_logger = None
 
+    def _initialize_driver(self):
+        """
+        Inicializa Selenium solo cuando es realmente necesario.
+        """
+        try:
+            chrome_options = Options()
+            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--headless=new')
+            chrome_options.add_argument('--window-size=1920x1080')
+            chrome_options.add_argument(f'user-agent={UserAgent().random}')
+            chrome_options.add_argument('--disk-cache=true')
+
+            self.driver = webdriver.Chrome(options=chrome_options)
+            self.spider_logger.info("🌐 Selenium inicializado correctamente")
+            return True
+        except Exception as e:
+            self.driver = None
+            self.spider_logger.warning(f"⚠️ No fue posible inicializar Selenium: {e}")
+            return False
+
+    def _add_if_present(self, loader, field, value):
+        """
+        Agrega un valor al loader solo si tiene contenido útil.
+        """
+        if value is not None and value != '':
+            loader.add_value(field, value)
+
+    def _extract_text(self, value):
+        """
+        Convierte estructuras anidadas (dict/list) a texto utilizable.
+        """
+        if value is None:
+            return None
+
+        if isinstance(value, list):
+            if not value:
+                return None
+            return self._extract_text(value[0])
+
+        if isinstance(value, dict):
+            for key in ('nombre', 'name', 'value', 'label', 'descripcion', 'id'):
+                if key in value and value[key] not in (None, ''):
+                    return str(value[key])
+            return None
+
+        return str(value)
+
+    def _extract_int(self, value):
+        """
+        Extrae enteros desde distintos formatos de entrada.
+        """
+        if value is None or isinstance(value, bool):
+            return None
+
+        if isinstance(value, (int, float)):
+            return int(value)
+
+        text_value = self._extract_text(value)
+        if not text_value:
+            return None
+
+        match = re.search(r'-?\d+', text_value.replace('.', '').replace(',', ''))
+        if not match:
+            return None
+
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return None
+
+    def _extract_float(self, value):
+        """
+        Extrae flotantes desde distintos formatos de entrada.
+        """
+        if value is None or isinstance(value, bool):
+            return None
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text_value = self._extract_text(value)
+        if not text_value:
+            return None
+
+        match = re.search(r'-?\d+(?:[\.,]\d+)?', text_value)
+        if not match:
+            return None
+
+        try:
+            return float(match.group(0).replace(',', '.'))
+        except ValueError:
+            return None
+
+    def _build_item_from_api(self, api_data, operation_type):
+        """
+        Construye un item usando exclusivamente datos de la API.
+        """
+        try:
+            loader = ItemLoader(item=ApartmentsItem())
+
+            property_id = api_data.get('midinmueble')
+            self._add_if_present(loader, 'codigo', property_id)
+            self._add_if_present(loader, 'tipo_operacion', self._extract_text(operation_type))
+
+            self._add_if_present(loader, 'tipo_propiedad', self._extract_text(api_data.get('mtipoinmueble')))
+            self._add_if_present(loader, 'precio_venta', self._extract_int(api_data.get('mvalorventa')))
+            self._add_if_present(loader, 'precio_arriendo', self._extract_int(api_data.get('mvalorarriendo')))
+            self._add_if_present(loader, 'area', self._extract_float(api_data.get('marea')))
+            self._add_if_present(loader, 'habitaciones', self._extract_int(api_data.get('mnrocuartos')))
+            self._add_if_present(loader, 'banos', self._extract_int(api_data.get('mnrobanos')))
+            self._add_if_present(loader, 'parqueaderos', self._extract_int(api_data.get('mnrogarajes')))
+            self._add_if_present(loader, 'estrato', self._extract_int(api_data.get('mestrato')))
+            self._add_if_present(loader, 'sector', self._extract_text(api_data.get('mnombrecomun')))
+            self._add_if_present(loader, 'descripcion', self._extract_text(api_data.get('mdescripcion')))
+
+            lat = api_data.get('mlatitud')
+            lon = api_data.get('mlongitud')
+            self._add_if_present(loader, 'latitud', self._extract_float(lat))
+            self._add_if_present(loader, 'longitud', self._extract_float(lon))
+
+            link = api_data.get('link')
+            if link:
+                full_link = f'https://www.metrocuadrado.com{link}' if str(link).startswith('/') else str(link)
+                self._add_if_present(loader, 'url', full_link)
+
+            self._add_if_present(loader, 'website', 'metrocuadrado.com')
+            self._add_if_present(loader, 'last_view', datetime.now())
+            self._add_if_present(loader, 'datetime', datetime.now())
+
+            return loader.load_item()
+        except Exception as e:
+            self.spider_logger.warning(f"⚠️ No se pudo construir item API-only: {e}")
+            return None
+
     def start_requests(self):
         """
         Generación dinámica de requests basada en totales reales de API
         """
-        # 🔧 NUEVO: Conectar a MongoDB al inicio
-        try:
-            self.db_client = pymongo.MongoClient(self.mongo_uri)
-            self.db = self.db_client[self.mongo_db]
-            self.spider_logger.info("🔗 Conectado a MongoDB para verificar apartamentos existentes")
-        except Exception as e:
-            self.spider_logger.error(f"❌ Error conectando a MongoDB: {e}")
-            self.spider_logger.info("⚠️ Continuando sin verificación de BD (modo completo)")
+        # MongoDB es opcional: si no hay URI configurada, desactivar verificación en BD.
+        if self.mongo_available:
+            try:
+                # Reducir timeout para evitar bloqueos largos cuando no hay servidor disponible.
+                self.db_client = pymongo.MongoClient(self.mongo_uri, serverSelectionTimeoutMS=3000)
+                self.db_client.admin.command('ping')
+                self.db = self.db_client[self.mongo_db]
+                self.spider_logger.info("🔗 Conectado a MongoDB para verificar apartamentos existentes")
+            except Exception as e:
+                self.spider_logger.warning(f"⚠️ MongoDB no disponible: {e}")
+                self.spider_logger.info("⚠️ Continuando sin verificación de BD (modo completo)")
+                self.mongo_available = False
+                self.db = None
+                if self.db_client:
+                    self.db_client.close()
+                    self.db_client = None
+        else:
+            self.spider_logger.info("🗂️ MONGO_URI no configurada: scraping en modo solo archivo (sin MongoDB)")
+
+        # Selenium solo aporta valor cuando se requiere scraping de detalle.
+        if self.mongo_available:
+            self.use_selenium = self._initialize_driver()
+            if not self.use_selenium:
+                self.spider_logger.info("⚠️ Continuando sin Selenium en modo API-only")
+        else:
+            self.use_selenium = False
         
         self.spider_logger.info("🚀 Iniciando descubrimiento de apartamentos disponibles...")
         
@@ -182,6 +330,21 @@ class MetrocuadradoSpider(scrapy.Spider):
                     continue
                 
                 processed_in_batch += 1
+
+                # Modo sin MongoDB: extracción directa API -> archivo, sin Selenium.
+                if not self.mongo_available:
+                    api_item = self._build_item_from_api(item, operation_type)
+                    if api_item:
+                        new_in_batch += 1
+                        self.stats['apartments_new'] += 1
+                        self.stats['successful_parses'] += 1
+                        if self.progress_logger:
+                            self.progress_logger.update(1, f"📄 {property_id} (api-only)")
+                        yield api_item
+                    else:
+                        self.stats['failed_parses'] += 1
+                    continue
+
                 existing_apartment = self._check_existing_apartment(property_id)
                 
                 if existing_apartment:
@@ -215,14 +378,25 @@ class MetrocuadradoSpider(scrapy.Spider):
                     # Yield el item para que el pipeline lo procese
                     yield loader.load_item()
                 else:
-                    # Apartamento nuevo, hacer scraping completo con Selenium
-                    new_in_batch += 1
-                    # self.spider_logger.info(f'🆕 Apartamento NUEVO: {property_id} - Scraping completo necesario (usando Selenium)')
-                    yield scrapy.Request(
-                        url=f'https://metrocuadrado.com{item["link"]}',
-                        callback=self.details_parse,
-                        meta={'operation_type': operation_type, 'api_data': item}
-                    )
+                    # Apartamento nuevo: usar Selenium solo cuando está disponible.
+                    if self.use_selenium:
+                        new_in_batch += 1
+                        yield scrapy.Request(
+                            url=f'https://metrocuadrado.com{item["link"]}',
+                            callback=self.details_parse,
+                            meta={'operation_type': operation_type, 'api_data': item}
+                        )
+                    else:
+                        api_item = self._build_item_from_api(item, operation_type)
+                        if api_item:
+                            new_in_batch += 1
+                            self.stats['apartments_new'] += 1
+                            self.stats['successful_parses'] += 1
+                            if self.progress_logger:
+                                self.progress_logger.update(1, f"📄 {property_id} (api-only)")
+                            yield api_item
+                        else:
+                            self.stats['failed_parses'] += 1
             
             # 📊 Log de resumen del batch
             if processed_in_batch > 0:
@@ -250,7 +424,7 @@ class MetrocuadradoSpider(scrapy.Spider):
         Returns:
             dict: Datos del apartamento existente o None si no existe
         """
-        if self.db is None:
+        if not self.mongo_available or self.db is None:
             return None
             
         try:
@@ -258,7 +432,13 @@ class MetrocuadradoSpider(scrapy.Spider):
             existing = self.db[self.collection_name].find_one({'codigo': property_id})
             return existing
         except Exception as e:
-            self.spider_logger.error(f"❌ Error verificando apartamento {property_id}: {e}")
+            self.spider_logger.warning(f"⚠️ Error verificando apartamento {property_id}: {e}")
+            self.spider_logger.info("⚠️ Se desactiva verificación en MongoDB para el resto de la ejecución")
+            self.mongo_available = False
+            self.db = None
+            if self.db_client:
+                self.db_client.close()
+                self.db_client = None
             return None
 
     def _process_existing_apartment(self, api_data, existing_data, operation_type):
@@ -485,7 +665,7 @@ class MetrocuadradoSpider(scrapy.Spider):
         log_scraping_stats(self.spider_logger, final_stats)
         
         # Cerrar conexiones
-        if hasattr(self, 'driver'):
+        if self.driver is not None:
             self.driver.quit()
             self.spider_logger.info("🔒 Navegador cerrado correctamente")
             

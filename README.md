@@ -99,7 +99,7 @@ pip install -r requirements_data_analysis.txt
 
 ```bash
 # Ejecutar scraper completo
-scrapy crawl habi_spider
+scrapy crawl habi
 scrapy crawl metrocuadrado_spider
 
 # Procesar datos
